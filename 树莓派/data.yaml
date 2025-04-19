@@ -1,0 +1,5 @@
+path: G:/bianchen/py/py/da
+train: images/train
+val: images/val
+nc: 5  # 修改为 4
+names: ['1','2','3','7','4']
