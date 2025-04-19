@@ -1,86 +1,71 @@
 import cv2
 import os
-import time
 import datetime
 
-# 创建保存图片的目录
-save_dir = "captured_images"
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-    print(f"已创建图片保存目录: {save_dir}")
-
-# 尝试打开摄像头
-print("正在打开摄像头...")
-cap = cv2.VideoCapture(0)  # 首先尝试默认摄像头
-
-# 如果默认摄像头打开失败，尝试其他摄像头
-if not cap.isOpened():
-    print("默认摄像头打开失败，尝试其他摄像头...")
-    for i in [1, 2]:
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            print(f"成功打开摄像头 {i}")
+def main():
+    # 创建保存图片的目录
+    save_dir = "captured_images"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        print(f"已创建图片保存目录: {save_dir}")
+    
+    # 打开摄像头
+    print("正在打开摄像头...")
+    cap = cv2.VideoCapture(0)
+    
+    # 设置摄像头参数
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    
+    # 检查摄像头是否打开成功
+    if not cap.isOpened():
+        print("无法打开摄像头")
+        return
+    
+    # 等待摄像头初始化
+    print("等待摄像头初始化...")
+    for _ in range(5):
+        cap.read()
+    
+    # 图片计数器
+    image_count = 0
+    
+    print("按下 'p' 键拍照，按下 'q' 键退出程序")
+    
+    while True:
+        # 读取一帧
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        # 显示当前帧，不添加任何文字
+        cv2.imshow("Camera", frame)
+        
+        # 检测按键
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('p'):  # 按下 'p' 键拍照
+            # 生成文件名
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"photo_{image_count}.jpg"
+            filepath = os.path.join(save_dir, filename)
+            
+            # 保存图片
+            cv2.imwrite(filepath, frame)
+            print(f"已保存照片: {filepath}")
+            
+            # 更新计数器
+            image_count += 1
+        
+        elif key == ord('q'):  # 按下 'q' 键退出
+            print("退出程序")
             break
-
-# 检查摄像头是否成功打开
-if not cap.isOpened():
-    print("无法打开任何摄像头，程序退出")
-    exit()
-
-# 设置分辨率
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-# 创建全英文名称的窗口
-window_name = "Camera Capture"
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-
-# 计数器
-image_count = 0
-
-print("摄像头准备就绪")
-print("按空格键拍照，按Q键退出")
-
-while True:
-    # 读取一帧
-    ret, frame = cap.read()
     
-    # 检查是否成功读取
-    if not ret:
-        print("无法读取摄像头画面，退出程序")
-        break
-    
-    # 在画面上显示计数器
-    info_text = f"Images: {image_count} | Press SPACE to capture, Q to quit"
-    cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
-    # 显示图像
-    cv2.imshow(window_name, frame)
-    
-    # 按键检测
-    key = cv2.waitKey(1) & 0xFF
-    
-    # 按空格键拍照
-    if key == 32:  # 空格键的ASCII码是32
-        # 生成文件名
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"image_{timestamp}_{image_count:04d}.jpg"
-        filepath = os.path.join(save_dir, filename)
-        
-        # 保存图片
-        cv2.imwrite(filepath, frame)
-        print(f"已保存图片: {filepath}")
-        
-        # 更新计数器
-        image_count += 1
-    
-    # 按Q键退出
-    elif key == ord('q') or key == ord('Q'):
-        print("程序结束")
-        break
+    # 释放资源
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"共拍摄了 {image_count} 张图片")
 
-# 释放资源
-cap.release()
-cv2.destroyAllWindows()
-print(f"共拍摄了 {image_count} 张图片")
-print(f"图片保存在: {os.path.abspath(save_dir)}") 
+if __name__ == "__main__":
+    main() 

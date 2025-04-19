@@ -1,4 +1,4 @@
-path: G:/bianchen/py/py/da
+path: G:/bianchen/xiangmu/Deliver medicine/YOLO_drill/da
 train: images/train
 val: images/val
 nc: 5  # 修改为 4
