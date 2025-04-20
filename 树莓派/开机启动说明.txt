@@ -1,0 +1,135 @@
+# Ubuntu 20.04树莓派开机自启动设置说明
+
+## 准备工作
+
+1. 已创建的启动脚本: `start_programs.sh`
+2. 确保该脚本已添加执行权限，在Ubuntu系统上运行:
+   ```
+   chmod +x start_programs.sh
+   ```
+
+## 方法一：使用rc.local（简单方法）
+
+**注意**: Ubuntu 20.04默认没有启用rc.local服务，需要先进行配置。
+
+1. 如果rc.local文件不存在，先创建rc.local文件：
+   ```
+   sudo nano /etc/rc.local
+   ```
+
+2. 添加以下内容：
+   ```
+   #!/bin/sh -e
+   
+   # 启动超声波和YOLO检测程序
+   /home/ubuntu/你的项目路径/start_programs.sh &
+   
+   exit 0
+   ```
+
+3. 保存并退出：按 Ctrl+X，然后按 Y，再按 Enter
+
+4. 确保rc.local有执行权限：
+   ```
+   sudo chmod +x /etc/rc.local
+   ```
+
+5. 创建systemd服务来启用rc.local（Ubuntu 20.04需要此步骤）：
+   ```
+   sudo nano /etc/systemd/system/rc-local.service
+   ```
+
+6. 添加以下内容：
+   ```
+   [Unit]
+   Description=RC Local service
+   After=network.target
+
+   [Service]
+   Type=forking
+   ExecStart=/etc/rc.local start
+   TimeoutSec=0
+   StandardOutput=tty
+   RemainAfterExit=yes
+   SysVStartPriority=99
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+7. 启用并启动rc-local服务：
+   ```
+   sudo systemctl enable rc-local.service
+   sudo systemctl start rc-local.service
+   ```
+
+## 方法二：使用systemd服务（推荐方法）
+
+1. 创建systemd服务文件：
+   ```
+   sudo nano /etc/systemd/system/detection-system.service
+   ```
+
+2. 添加以下内容（替换路径为实际脚本路径）：
+   ```
+   [Unit]
+   Description=Ultrasonic and YOLO Detection System
+   After=network.target
+
+   [Service]
+   ExecStart=/home/ubuntu/你的项目路径/start_programs.sh
+   User=ubuntu
+   WorkingDirectory=/home/ubuntu/你的项目路径
+   Restart=always
+   RestartSec=10
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+3. 保存并退出：按 Ctrl+X，然后按 Y，再按 Enter
+
+4. 重新加载systemd配置：
+   ```
+   sudo systemctl daemon-reload
+   ```
+
+5. 启用服务，使其开机自启：
+   ```
+   sudo systemctl enable detection-system.service
+   ```
+
+6. 立即启动服务（无需重启）：
+   ```
+   sudo systemctl start detection-system.service
+   ```
+
+7. 检查服务状态：
+   ```
+   sudo systemctl status detection-system.service
+   ```
+
+## 故障排查
+
+1. 查看日志文件，位于项目目录下的logs文件夹中
+
+2. 检查系统日志，查找潜在错误：
+   ```
+   sudo journalctl -u detection-system.service
+   ```
+
+3. 确保Python脚本中使用了绝对路径引用文件和资源
+
+4. 确保使用的用户（ubuntu）对项目目录有读写权限：
+   ```
+   sudo chown -R ubuntu:ubuntu /home/ubuntu/你的项目路径
+   ```
+
+5. 如果使用普通用户执行需要root权限的操作，考虑使用sudoers配置无密码执行：
+   ```
+   sudo visudo
+   ```
+   添加类似以下行（根据实际需求调整）：
+   ```
+   ubuntu ALL=(ALL) NOPASSWD: /路径/到/特定/命令
+   ``` 

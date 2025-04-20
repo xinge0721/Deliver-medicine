@@ -8,6 +8,19 @@ import serial
 import numpy as np
 from collections import defaultdict
 
+# 设置环境变量禁用所有网络连接
+os.environ['ULTRALYTICS_OFFLINE'] = '1'
+os.environ['CURL_CA_BUNDLE'] = ''  # 禁用SSL验证
+os.environ['no_proxy'] = '*'  # 禁用代理
+
+# 在导入其他模块前禁用网络
+import urllib.request
+# 重写urlopen函数，防止任何网络请求
+original_urlopen = urllib.request.urlopen
+def offline_urlopen(url, *args, **kwargs):
+    raise Exception("离线模式：禁止网络连接")
+urllib.request.urlopen = offline_urlopen
+
 # ================= 全局配置 =================
 MODEL_PATH = "best.pt"  # 模型路径
 NUM_THREADS = 3       # 线程数
@@ -16,6 +29,12 @@ PORT = '/dev/ttyUSB0'  # 串口端口
 BAUDRATE = 115200       # 串口波特率
 CONFIDENCE_THRESHOLD = 0.7  # 模型置信度阈值，越高越严格（范围0-1）
 CENTER_MARGIN = 20  # 中心区域误差值（像素），越大中心区域容错越大
+MAX_RETRY_COUNT = 2  # 未检测到有效数字时的最大重试次数
+
+# 图片保存配置
+SAVE_IMAGES = True  # 是否保存图片
+SAVE_PATH = "captured_images"  # 图片保存路径
+SAVE_DETECTION_RESULTS = True  # 是否保存标记了检测结果的图片
 
 # 摄像头和图像处理参数
 # 更高的分辨率可以提高识别准确性，但会增加处理时间
@@ -62,6 +81,100 @@ class GlobalState:
         # 使用defaultdict避免键不存在的问题
         self.results = defaultdict(dict)  # {frame_id: {thread_id: results}}
 
+# ================= 图片保存函数 =================
+def ensure_save_directory_exists():
+    """
+    确保图片保存目录存在，如果不存在则创建
+    """
+    if not os.path.exists(SAVE_PATH):
+        os.makedirs(SAVE_PATH)
+        print(f"创建图片保存目录: {SAVE_PATH}")
+
+def save_image(frame, filename_prefix, detections=None):
+    """
+    保存图片，可选择是否标记检测结果
+    
+    参数:
+        frame: 要保存的图像帧
+        filename_prefix: 文件名前缀
+        detections: 检测结果列表，如果不为None则在图像上标记检测框
+    """
+    if not SAVE_IMAGES:
+        return
+        
+    ensure_save_directory_exists()
+    
+    # 生成时间戳用于文件命名
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    
+    # 构建完整文件名
+    filename = f"{SAVE_PATH}/{filename_prefix}_{timestamp}.jpg"
+    
+    # 如果需要标记检测结果
+    if detections and SAVE_DETECTION_RESULTS:
+        # 创建图像副本以便标记
+        marked_frame = frame.copy()
+        
+        # 在图像上标记检测框和类别
+        for det in detections:
+            # 获取边界框
+            x1, y1, x2, y2 = det['box']
+            
+            # 获取类别和置信度
+            class_name = det['class']
+            confidence = det['confidence']
+            
+            # 绘制矩形边界框
+            color = (0, 255, 0)  # 绿色
+            cv2.rectangle(marked_frame, (x1, y1), (x2, y2), color, 2)
+            
+            # 绘制类别标签
+            label = f"{class_name}: {confidence:.2f}"
+            cv2.putText(marked_frame, label, (x1, y1 - 10), 
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        # 保存标记了检测结果的图像
+        marked_filename = f"{SAVE_PATH}/{filename_prefix}_detected_{timestamp}.jpg"
+        cv2.imwrite(marked_filename, marked_frame)
+        print(f"已保存标记检测结果图片: {marked_filename}")
+        
+    # 保存原始图像
+    cv2.imwrite(filename, frame)
+    print(f"已保存原始图片: {filename}")
+    
+    return filename
+
+# ================= 串口通信函数 =================
+def send_serial_data(ser, data):
+    """
+    使用指定帧格式发送串口数据
+    
+    帧格式:
+        帧头: 0xFF
+        数据: 单字节数据
+        帧尾: 0xEE
+        
+    参数:
+        ser: 串口对象
+        data: 要发送的数据(单字节字符或整数)
+    """
+    if isinstance(data, str):
+        # 如果是字符串，转换为整数
+        data_byte = ord(data[0]) if data else 0
+    elif isinstance(data, bytes):
+        # 如果是字节，直接获取值
+        data_byte = data[0] if data else 0
+    else:
+        # 如果是整数，直接使用
+        data_byte = data
+    
+    # 创建数据包: 帧头 + 数据 + 帧尾
+    frame = bytes([0xFF, data_byte, 0xEE])
+    
+    # 发送数据包
+    ser.write(frame)
+    print(f"串口发送: 帧头[0xFF] 数据[{data_byte}] 帧尾[0xEE]")
+
 # ================= 线程函数 =================
 def processing_worker(thread_id, frame_queue, state, model=None):
     """
@@ -79,7 +192,12 @@ def processing_worker(thread_id, frame_queue, state, model=None):
     # 如果没有提供模型，则创建新模型
     # 模型用于执行图像识别
     if model is None:
-        model = YOLO(MODEL_PATH)
+        try:
+            model = YOLO(MODEL_PATH)
+            print(f"线程 {thread_id} 创建本地模型成功")
+        except Exception as e:
+            print(f"线程 {thread_id} 创建模型失败: {e}")
+            return
     
     # 无限循环，持续处理队列中的图像
     while True:
@@ -94,11 +212,19 @@ def processing_worker(thread_id, frame_queue, state, model=None):
                 break
             
             # 执行YOLO推理（目标检测）
-            # conf: 置信度阈值，只有高于这个值的检测结果才会被保留
-            # imgsz: 输入图像大小，使用全局设置的MODEL_IMAGE_SIZE
-            # iou: 交并比阈值，用于非极大值抑制，避免重复检测
-            # verbose: 是否打印详细信息
-            results = model.predict(frame, conf=CONFIDENCE_THRESHOLD, imgsz=MODEL_IMAGE_SIZE, iou=0.45, verbose=False)
+            try:
+                # conf: 置信度阈值，只有高于这个值的检测结果才会被保留
+                # imgsz: 输入图像大小，使用全局设置的MODEL_IMAGE_SIZE
+                # iou: 交并比阈值，用于非极大值抑制，避免重复检测
+                # verbose: 是否打印详细信息
+                results = model.predict(frame, conf=CONFIDENCE_THRESHOLD, imgsz=MODEL_IMAGE_SIZE, iou=0.45, verbose=False)
+            except Exception as e:
+                print(f"线程 {thread_id} 执行预测时出错: {e}")
+                # 报告空结果
+                with state.lock:
+                    if frame_id == state.active_frame_id:
+                        state.results[frame_id][thread_id] = []
+                continue
             
             # 创建一个空列表，用于存储本次检测的所有结果
             detections = []
@@ -281,13 +407,13 @@ def check_digit_location(number, detections, frame_width, margin=None):
         margin: 中心区域误差值，如果为None则使用全局设置CENTER_MARGIN
         
     返回:
-        "0": 未找到匹配数字
-        "1": 数字在左侧
-        "2": 数字在右侧
+        0x00: 未找到匹配数字
+        0x01: 数字在左侧
+        0x02: 数字在右侧
     """
     # a. 检查参数有效性
     if not number or not detections:
-        return "0"  # 未找到匹配数字
+        return 0x00  # 未找到匹配数字
     
     # b. 如果未指定margin，使用全局设置
     if margin is None:
@@ -307,20 +433,20 @@ def check_digit_location(number, detections, frame_width, margin=None):
             if center_x < left_threshold:
                 # 数字在左侧阈值以外
                 print(f"  找到匹配的数字 {number} 在左侧 (x={center_x})")
-                return "1"  # 左侧
+                return 0x01  # 左侧
             elif center_x > right_threshold:
                 # 数字在右侧阈值以外
                 print(f"  找到匹配的数字 {number} 在右侧 (x={center_x})")
-                return "2"  # 右侧
+                return 0x02  # 右侧
             else:
                 # 数字在中心区域（在左右阈值之间）
                 print(f"  找到匹配的数字 {number} 在中心区域 (x={center_x})")
                 # 在中心区域时，根据是否靠近中心点左侧或右侧来判断
-                return "1" if center_x <= center_threshold else "2"
+                return 0x01 if center_x <= center_threshold else 0x02
     
     # f. 未在检测结果中找到匹配的数字
     print(f"  未发现与参考数字 {number} 匹配的对象")
-    return "0"  # 没有匹配的数字
+    return 0x00  # 没有匹配的数字
 
 def print_detection_details(detections, stage, frame_width=None, reference_number=None):
     """
@@ -441,6 +567,10 @@ def main():
     初始化所有组件，创建线程，处理串口通信，协调检测过程。
     """
     
+    # 创建图片保存目录
+    if SAVE_IMAGES:
+        ensure_save_directory_exists()
+    
     # 初始化全局状态对象，用于线程间共享数据
     state = GlobalState()
     
@@ -461,8 +591,30 @@ def main():
         return
     
     # 加载YOLO模型（为每个线程创建一个独立的模型实例）
-    print("正在加载YOLO模型...")
-    models = [YOLO(MODEL_PATH) for _ in range(NUM_THREADS)]
+    try:
+        print("正在加载YOLO模型...")
+        # 确认模型文件存在
+        if not os.path.exists(MODEL_PATH):
+            print(f"错误：模型文件 {MODEL_PATH} 不存在！")
+            return
+            
+        models = []
+        for i in range(NUM_THREADS):
+            try:
+                # 离线加载模型
+                model = YOLO(MODEL_PATH)
+                models.append(model)
+                print(f"线程 {i+1} 模型加载成功")
+            except Exception as e:
+                print(f"线程 {i+1} 模型加载失败: {e}")
+                return
+        
+        if not models:
+            print("所有模型加载失败，程序退出")
+            return
+    except Exception as e:
+        print(f"加载模型时出错: {e}")
+        return
     
     # 打印模型的类别信息（帮助调试）
     print("\n===== YOLO模型类别信息 =====")
@@ -503,15 +655,147 @@ def main():
             # 读取串口数据（最多4字节）
             data = ser.read(4)
             
-            # 检查是否接收到指定信号（4个0xFF字节）
-            if data == b'\xFF\xFF\xFF\xFF':
-                print("收到串口信号，开始拍照...")
+            # 检查是否接收到指定信号
+            if data == b'\xAA\xAA\xAA\xAA':
+                # 接收到四个0xAA字节，获取或更新参考数字
+                print("收到串口信号[0xAA]，开始获取/更新参考数字...")
+                
+                # 无论先前是否已完成检测，都进行新的参考数字获取
+                # 重置首次检测完成事件
+                state.first_detection_completed.clear()
+                
+                retry_count = 0  # 初始化重试计数器
+                final_number = None  # 初始化最终识别的数字
+                
+                # 重试循环，直到找到有效数字或达到最大重试次数
+                while retry_count < MAX_RETRY_COUNT and final_number is None:
+                    # 拍摄单帧照片
+                    frame, frame_width = capture_single_frame()
+                    if frame is None:
+                        # 拍摄失败，增加重试计数
+                        retry_count += 1
+                        print(f"拍照失败，第 {retry_count}/{MAX_RETRY_COUNT} 次重试")
+                        continue
+                    
+                    # 保存原始拍摄图片
+                    save_image(frame, f"reference_attempt{retry_count}")
+                    
+                    # 更新帧状态（使用锁保护共享数据）
+                    with state.lock:
+                        # 递增帧计数器
+                        state.frame_counter += 1
+                        # 记录当前帧ID
+                        current_frame_id = state.frame_counter
+                        # 更新当前活动帧ID
+                        state.active_frame_id = current_frame_id
+                        # 为当前帧初始化结果存储空间
+                        state.results[current_frame_id] = {}
+                    
+                    print(f"拍摄第 {current_frame_id} 张照片 (重试 {retry_count}/{MAX_RETRY_COUNT})")
+                    
+                    # 分发任务到各处理线程（每个线程处理同一张图像的副本）
+                    for q in frame_queues:
+                        q.put((current_frame_id, frame.copy()))
+                    
+                    # 等待所有线程完成检测 (最多等待5秒)
+                    start_time = time.time()
+                    all_completed = False
+                    
+                    # 等待循环，检查是否所有线程都完成了处理
+                    while time.time() - start_time < 5:  # 最多等待5秒
+                        with state.lock:  # 使用锁访问共享数据
+                            # 检查是否所有线程都已经贡献了结果
+                            if len(state.results[current_frame_id]) == NUM_THREADS:
+                                all_completed = True
+                                break
+                        # 短暂休眠，避免过度消耗CPU
+                        time.sleep(0.01)
+                    
+                    # 检查是否有未完成的线程
+                    if not all_completed:
+                        print(f"警告：等待超时，部分线程可能未完成检测")
+                    
+                    # 收集所有线程的检测结果
+                    all_detections = []
+                    with state.lock:  # 使用锁访问共享数据
+                        # 遍历当前帧的所有线程结果
+                        for thread_id, detections in state.results[current_frame_id].items():
+                            print(f"合并线程 {thread_id} 的 {len(detections)} 个检测结果")
+                            # 将线程检测结果添加到总列表
+                            all_detections.extend(detections)
+                    
+                    # 应用非极大值抑制，合并重复检测
+                    filtered_detections = apply_nms(all_detections)
+                    
+                    # 保存标记了检测结果的图片
+                    save_image(frame, f"reference_detected{retry_count}", filtered_detections)
+                    
+                    # 打印检测结果摘要
+                    print(f"\n===== 检测结果 (重试 {retry_count}/{MAX_RETRY_COUNT}) =====")
+                    print(f"总共检测到 {len(all_detections)} 个原始对象，应用NMS后保留 {len(filtered_detections)} 个")
+                    
+                    # 打印首次检测结果的详细信息
+                    print_detection_details(filtered_detections, f"参考数字获取(重试 {retry_count}/{MAX_RETRY_COUNT})")
+                    
+                    # 通过多数投票确定最佳数字
+                    final_number = majority_vote(filtered_detections)
+                    
+                    if final_number:
+                        # 找到有效数字，跳出重试循环
+                        print(f"检测到有效数字: {final_number}，停止重试")
+                        break
+                    else:
+                        # 未找到有效数字，增加重试计数
+                        retry_count += 1
+                        print(f"未检测到有效数字，第 {retry_count}/{MAX_RETRY_COUNT} 次重试")
+                        # 如果还没达到最大重试次数，等待短暂时间后再次尝试
+                        if retry_count < MAX_RETRY_COUNT:
+                            time.sleep(0.5)  # 等待0.5秒再次尝试
+                
+                # 重试循环结束后的处理
+                if final_number:
+                    # 设置/更新参考数字（用于后续检测比对）
+                    state.first_detected_number = final_number
+                    # 设置首次检测完成事件
+                    state.first_detection_completed.set()
+                    print(f"参考数字更新为: {final_number}")
+                    
+                    # 发送完成信号到串口 - 成功时发送0xFE
+                    send_serial_data(ser, 0xFE)
+                    print(f"已发送参考数字更新成功信号(0xFE)，参考数字: {final_number}")
+                else:
+                    # 达到最大重试次数仍未找到有效数字
+                    print(f"经过 {MAX_RETRY_COUNT} 次重试后仍未发现有效数字")
+                    # 如果之前已经有参考数字，保留原参考数字
+                    if state.first_detected_number:
+                        print(f"保留原参考数字: {state.first_detected_number}")
+                        state.first_detection_completed.set()
+                    
+                    # 发送失败信号 - 0x00
+                    send_serial_data(ser, 0x00)
+                    print("已发送参考数字更新失败信号(0x00)")
+                
+                print("=== 参考数字处理完成 ===")
+                
+            elif data == b'\xFF\xFF\xFF\xFF':
+                # 接收到四个0xFF字节，进行普通识别但不更新参考数字
+                print("收到串口信号[0xFF]，开始普通识别...")
+                
+                # 如果参考数字尚未设置，则提示错误
+                if not state.first_detection_completed.is_set():
+                    print("错误：尚未设置参考数字，无法进行识别！")
+                    send_serial_data(ser, b'0')  # 发送错误信号
+                    continue
                 
                 # 拍摄单帧照片
                 frame, frame_width = capture_single_frame()
                 if frame is None:
-                    # 拍摄失败，跳过本次循环
+                    # 拍摄失败，发送错误信号
+                    send_serial_data(ser, b'0')
                     continue
+                
+                # 保存原始拍摄图片
+                save_image(frame, "recognition_original")
                 
                 # 更新帧状态（使用锁保护共享数据）
                 with state.lock:
@@ -524,7 +808,7 @@ def main():
                     # 为当前帧初始化结果存储空间
                     state.results[current_frame_id] = {}
                 
-                print(f"拍摄第 {current_frame_id} 张照片")
+                print(f"拍摄第 {current_frame_id} 张照片进行普通识别")
                 
                 # 分发任务到各处理线程（每个线程处理同一张图像的副本）
                 for q in frame_queues:
@@ -560,77 +844,52 @@ def main():
                 # 应用非极大值抑制，合并重复检测
                 filtered_detections = apply_nms(all_detections)
                 
+                # 保存标记了检测结果的图片
+                save_image(frame, "recognition_detected", filtered_detections)
+                
                 # 打印检测结果摘要
                 print(f"\n===== 检测结果 =====")
                 print(f"总共检测到 {len(all_detections)} 个原始对象，应用NMS后保留 {len(filtered_detections)} 个")
                 
-                # 根据是否已完成首次检测，执行不同的处理逻辑
-                if not state.first_detection_completed.is_set():
-                    # ===== 首次检测处理逻辑 =====
-                    # 打印首次检测结果的详细信息
-                    print_detection_details(filtered_detections, "首次")
-                    
-                    # 通过多数投票确定最佳数字
-                    final_number = majority_vote(filtered_detections)
-                    
-                    if final_number:
-                        # 设置参考数字（用于后续检测比对）
-                        state.first_detected_number = final_number
-                        # 设置首次检测完成事件
-                        state.first_detection_completed.set()
-                        print(f"首次检测选择了数字: {final_number} 作为参考")
-                        
-                        # 发送完成信号到串口
-                        ser.write(b'0')
-                        print(f"已发送首次检测完成信号，参考数字: {final_number}")
+                # 打印后续检测的详细信息，包括位置和匹配状态
+                print_detection_details(
+                    filtered_detections, 
+                    "识别", 
+                    frame_width, 
+                    state.first_detected_number
+                )
+                
+                # 确定检测到的数字相对于图像中心的位置
+                result = check_digit_location(
+                    state.first_detected_number,  # 参考数字
+                    filtered_detections,          # 当前检测结果
+                    frame_width                   # 图像宽度
+                )
+                
+                # 发送结果到串口: 0(无匹配), 1(左侧), 2(右侧)
+                send_serial_data(ser, result)
+                
+                # 显示检测比对结果
+                print("\n=== 识别比对结果 ===")
+                if result == 0x00:
+                    # 处理未找到匹配数字的情况
+                    if not state.first_detected_number:
+                        print("参考数字为空，未能进行有效比对")
+                    elif not filtered_detections:
+                        print("当前帧未检测到任何对象，无法比对")
                     else:
-                        # 未找到有效数字的处理
-                        print("首次检测未发现有效数字")
-                        ser.write(b'0')  # 仍然发送信号表示检测完成
-                        print("已发送首次检测完成信号，但未发现有效数字")
-                    
-                    print("=== 首次检测完成 ===")
+                        print("检测到对象但没有匹配的数字，已发送: 0x00")
+                elif result == 0x01:
+                    # 数字在左侧
+                    print(f"检测到数字 {state.first_detected_number} 在左侧，已发送: 0x01")
                 else:
-                    # ===== 后续检测处理逻辑 =====
-                    # 打印后续检测的详细信息，包括位置和匹配状态
-                    print_detection_details(
-                        filtered_detections, 
-                        "后续", 
-                        frame_width, 
-                        state.first_detected_number
-                    )
-                    
-                    # 确定检测到的数字相对于图像中心的位置
-                    result = check_digit_location(
-                        state.first_detected_number,  # 参考数字
-                        filtered_detections,          # 当前检测结果
-                        frame_width                   # 图像宽度
-                    )
-                    
-                    # 发送结果到串口: 0(无匹配), 1(左侧), 2(右侧)
-                    ser.write(result.encode('utf-8'))
-                    
-                    # 显示检测比对结果
-                    print("\n=== 后续检测比对结果 ===")
-                    if result == "0":
-                        # 处理未找到匹配数字的情况
-                        if not state.first_detected_number:
-                            print("参考数字为空，未能进行有效比对")
-                        elif not filtered_detections:
-                            print("当前帧未检测到任何对象，无法比对")
-                        else:
-                            print("检测到对象但没有匹配的数字，已发送: 0")
-                    elif result == "1":
-                        # 数字在左侧
-                        print(f"检测到数字 {state.first_detected_number} 在左侧，已发送: 1")
-                    else:
-                        # 数字在右侧
-                        print(f"检测到数字 {state.first_detected_number} 在右侧，已发送: 2")
-                    
-                    # 打印参考信息
-                    print(f"首次保存的参考数字: {state.first_detected_number if state.first_detected_number else '无'}")
-                    print("===========================\n")
-            
+                    # 数字在右侧
+                    print(f"检测到数字 {state.first_detected_number} 在右侧，已发送: 0x02")
+                
+                # 打印参考信息
+                print(f"当前参考数字: {state.first_detected_number if state.first_detected_number else '无'}")
+                print("===========================\n")
+                
             # 短暂休眠，避免CPU过度使用
             time.sleep(0.01)
     
@@ -666,6 +925,21 @@ def main():
 
 if __name__ == "__main__":
     try:
+        print("\n===== YOLO离线检测系统启动 =====")
+        print("模式: 完全离线")
+        print(f"模型路径: {MODEL_PATH}")
+        print(f"处理线程数: {NUM_THREADS}")
+        print(f"串口设置: {PORT}, {BAUDRATE} 波特率")
+        print(f"置信度阈值: {CONFIDENCE_THRESHOLD}")
+        print("\n串口通信协议:")
+        print("接收命令: 0xAA,0xAA,0xAA,0xAA - 获取参考数字")
+        print("         0xFF,0xFF,0xFF,0xFF - 执行位置识别")
+        print("发送数据: [0xFF][数据][0xEE] 格式")
+        print("发送值:   0xFE - 参考数字锁定成功")
+        print("         0x00 - 参考数字锁定失败/未找到匹配数字")
+        print("         0x01 - 数字在左侧")
+        print("         0x02 - 数字在右侧")
+        print("==================================\n")
         main()
     except Exception as e:
         print(f"程序执行错误: {e}")
