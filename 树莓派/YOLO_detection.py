@@ -28,7 +28,8 @@ FRAME_QUEUE_SIZE = 1  # 严格控制队列深度
 PORT = '/dev/ttyUSB0'  # 串口端口
 BAUDRATE = 115200       # 串口波特率
 CONFIDENCE_THRESHOLD = 0.7  # 模型置信度阈值，越高越严格（范围0-1）
-CENTER_MARGIN = 20  # 中心区域误差值（像素），越大中心区域容错越大
+CENTER_OFFSET = 0  # 中心点校准值（像素），正值向右偏移，负值向左偏移
+CENTER_MARGIN = 20  # 中心区域容错值（像素），越大中心区域容错越大
 MAX_RETRY_COUNT = 2  # 未检测到有效数字时的最大重试次数
 
 # 图片保存配置
@@ -393,7 +394,7 @@ def majority_vote(detections):
     # f. 当有多个出现次数相同的类别时，选择置信度总和最高的类别
     return max(candidates, key=lambda x: class_stats[x]['total_conf'])
 
-def check_digit_location(number, detections, frame_width, margin=None):
+def check_digit_location(number, detections, frame_width, margin=None, offset=None):
     """
     检查特定数字在图像中的位置（左侧还是右侧）
     
@@ -404,7 +405,8 @@ def check_digit_location(number, detections, frame_width, margin=None):
         number: 要检查的数字（字符串）
         detections: 检测结果列表
         frame_width: 图像宽度（像素）
-        margin: 中心区域误差值，如果为None则使用全局设置CENTER_MARGIN
+        margin: 中心区域容错值，如果为None则使用全局设置CENTER_MARGIN
+        offset: 中心点校准值，如果为None则使用全局设置CENTER_OFFSET
         
     返回:
         0x00: 未找到匹配数字
@@ -415,14 +417,17 @@ def check_digit_location(number, detections, frame_width, margin=None):
     if not number or not detections:
         return 0x00  # 未找到匹配数字
     
-    # b. 如果未指定margin，使用全局设置
+    # b. 如果未指定margin或offset，使用全局设置
     if margin is None:
         margin = CENTER_MARGIN
+    if offset is None:
+        offset = CENTER_OFFSET
     
-    # c. 计算图像中心和左右阈值
-    center_threshold = frame_width // 2  # 图像中心点X坐标
-    left_threshold = center_threshold - margin  # 左侧阈值
-    right_threshold = center_threshold + margin  # 右侧阈值
+    # c. 计算校准后的图像中心和左右阈值
+    # 使用偏移值调整中心点位置
+    center_point = (frame_width // 2) + offset  # 校准后的中心点X坐标
+    left_threshold = center_point - margin  # 左侧阈值
+    right_threshold = center_point + margin  # 右侧阈值
     
     # d. 在所有检测结果中寻找匹配的数字
     for det in detections:
@@ -432,17 +437,17 @@ def check_digit_location(number, detections, frame_width, margin=None):
             # e. 判断数字位置，考虑中心误差
             if center_x < left_threshold:
                 # 数字在左侧阈值以外
-                print(f"  找到匹配的数字 {number} 在左侧 (x={center_x})")
+                print(f"  找到匹配的数字 {number} 在左侧 (x={center_x}, 中心点={center_point}, 偏移={offset})")
                 return 0x01  # 左侧
             elif center_x > right_threshold:
                 # 数字在右侧阈值以外
-                print(f"  找到匹配的数字 {number} 在右侧 (x={center_x})")
+                print(f"  找到匹配的数字 {number} 在右侧 (x={center_x}, 中心点={center_point}, 偏移={offset})")
                 return 0x02  # 右侧
             else:
                 # 数字在中心区域（在左右阈值之间）
-                print(f"  找到匹配的数字 {number} 在中心区域 (x={center_x})")
+                print(f"  找到匹配的数字 {number} 在中心区域 (x={center_x}, 中心点={center_point}, 偏移={offset})")
                 # 在中心区域时，根据是否靠近中心点左侧或右侧来判断
-                return 0x01 if center_x <= center_threshold else 0x02
+                return 0x01 if center_x <= center_point else 0x02
     
     # f. 未在检测结果中找到匹配的数字
     print(f"  未发现与参考数字 {number} 匹配的对象")
@@ -863,7 +868,9 @@ def main():
                 result = check_digit_location(
                     state.first_detected_number,  # 参考数字
                     filtered_detections,          # 当前检测结果
-                    frame_width                   # 图像宽度
+                    frame_width,                  # 图像宽度
+                    CENTER_MARGIN,                 # 中心区域容错值
+                    CENTER_OFFSET                 # 中心点校准值
                 )
                 
                 # 发送结果到串口: 0(无匹配), 1(左侧), 2(右侧)
@@ -931,6 +938,9 @@ if __name__ == "__main__":
         print(f"处理线程数: {NUM_THREADS}")
         print(f"串口设置: {PORT}, {BAUDRATE} 波特率")
         print(f"置信度阈值: {CONFIDENCE_THRESHOLD}")
+        print(f"中心点校准: {CENTER_OFFSET}像素 (正值向右偏移，负值向左偏移)")
+        print(f"中心区域容错: {CENTER_MARGIN}像素")
+        
         print("\n串口通信协议:")
         print("接收命令: 0xAA,0xAA,0xAA,0xAA - 获取参考数字")
         print("         0xFF,0xFF,0xFF,0xFF - 执行位置识别")
